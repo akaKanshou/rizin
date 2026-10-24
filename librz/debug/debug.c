@@ -11,15 +11,6 @@
 
 RZ_LIB_VERSION(rz_debug);
 
-#if __linux__ && DEBUGGER
-// Defined by the native Linux debugger plugin, which is compiled into this same
-// library (librz_debug) under the same conditions as this file. Declared here so
-// that rz_debug_continue() can switch to a forked child without resorting to a
-// fragile runtime dlsym() lookup (the symbol has hidden visibility and cannot be
-// resolved that way).
-extern bool linux_attach_new_process(RzDebug *dbg, int pid);
-#endif
-
 // Size of the lookahead buffers used in rz_debug functions
 #define DBG_BUF_SIZE 512
 
@@ -398,18 +389,17 @@ RZ_API RZ_OWN RzDebug *rz_debug_new(RZ_BORROW RZ_NONNULL RzBreakpointContext *bp
 	dbg->pid = -1;
 	dbg->tid = -1;
 	dbg->tree = rz_tree_new();
-	dbg->tracenodes = ht_up_new(NULL, NULL);
+	dbg->tracenodes = ht_up_new(NULL, free);
 	dbg->swstep = false;
 	dbg->stop_all_threads = false;
 	dbg->trace = rz_debug_trace_new();
-	dbg->cb_printf = (void *)printf;
+	dbg->cb_printf = (PrintfCallback)rz_cb_default_printf;
 	dbg->reg = rz_reg_new();
 	dbg->num = rz_num_new(rz_debug_num_callback, rz_debug_str_callback, dbg);
 	dbg->cur = NULL;
 	dbg->plugin_data = NULL;
-	dbg->threads = ht_up_new();
+	dbg->threads = NULL;
 	dbg->hitinfo = 1;
-	dbg->processes = rz_list_new();
 	/* TODO: needs a redesign? */
 	dbg->maps = rz_debug_map_list_new();
 	dbg->maps_user = rz_debug_map_list_new();
@@ -441,7 +431,7 @@ RZ_API void rz_debug_free(RzDebug *dbg) {
 	free(dbg->snap_path);
 	rz_list_free(dbg->maps);
 	rz_list_free(dbg->maps_user);
-	ht_up_free(dbg->threads);
+	rz_list_free(dbg->threads);
 	rz_num_free(dbg->num);
 	sdb_free(dbg->sgnls);
 	rz_tree_free(dbg->tree);
@@ -635,7 +625,7 @@ RZ_API bool rz_debug_select(RzDebug *dbg, int pid, int tid) {
 		dbg->tid = tid;
 	}
 
-	rz_io_system(dbg->iob.io, rz_strf(tmpbuf, "pid %d", dbg->tid));
+	free(rz_io_system(dbg->iob.io, rz_strf(tmpbuf, "pid %d", dbg->tid)));
 
 	// Synchronize with the current thread's data
 	if (dbg->corebind.core) {
@@ -789,7 +779,7 @@ RZ_API RzDebugReasonType rz_debug_wait(RzDebug *dbg, RzBreakpointItem **bp) {
 			int what = rz_debug_signal_what(dbg, dbg->reason.signum);
 			const char *name = rz_signal_to_string(dbg->reason.signum);
 			if (name && strcmp("SIGTRAP", name)) {
-				rz_cons_printf("[+] signal %d aka %s received %d\n",
+				rz_cons_printf(dbg->cons, "[+] signal %d aka %s received %d\n",
 					dbg->reason.signum, name, what);
 			}
 		}
@@ -1160,222 +1150,270 @@ RZ_API int rz_debug_step_cnum(RzDebug *dbg, int steps) {
 	return steps;
 }
 
-RZ_API int rz_debug_continue_kill(RzDebug *dbg, int sig) {
-	RzDebugReasonType reason = RZ_DEBUG_REASON_NONE;
-	int ret = 0;
-	RzBreakpointItem *bp = NULL;
-#if __linux__
-	// Tracks the iteration on which we just followed a forked child, so its
-	// pending post-fork SIGSTOP can be swallowed on the next wait (see below).
-	bool followed_child = false;
-	bool just_followed_child = false;
-#endif
+static bool skip_current_instruction(RzDebug *dbg) {
+	ut8 buf[64];
+	RzAnalysisOp op = { 0 };
+	ut64 pc = rz_debug_reg_get_by_role(dbg, RZ_REG_NAME_PC);
 
+	dbg->iob.read_at(dbg->iob.io, pc, buf, sizeof(buf));
+
+	rz_analysis_op_init(&op);
+	rz_analysis_op(dbg->analysis, &op, pc, buf, sizeof(buf),
+		RZ_ANALYSIS_OP_MASK_BASIC);
+
+	if (op.size <= 0) {
+		rz_analysis_op_fini(&op);
+		return false;
+	}
+
+	rz_debug_reg_set_by_role(dbg, RZ_REG_NAME_PC, pc + op.size);
+	rz_analysis_op_fini(&op);
+	return true;
+}
+
+static int session_forward_to_breakpoint(RzDebug *dbg) {
+	bool has_bp = false;
+	RzRegItem *ripc = rz_reg_get_by_role(dbg->reg, RZ_REG_NAME_PC);
+	if (!ripc) {
+		return 0;
+	}
+	RzVector *vreg = ht_up_find(dbg->session->registers, ripc->offset | (ripc->arena << 16), NULL);
+	RzDebugChangeReg *reg;
+	rz_vector_foreach_prev (vreg, reg) {
+		if (reg->cnum <= dbg->session->cnum) {
+			continue;
+		}
+		has_bp = rz_bp_get_in(dbg->bp, reg->data, RZ_PERM_X) != NULL;
+		if (has_bp) {
+			eprintf("hit breakpoint at: 0x%" PFMT64x " cnum: %d\n", reg->data, reg->cnum);
+			rz_debug_goto_cnum(dbg, reg->cnum);
+			return dbg->tid;
+		}
+	}
+
+	rz_debug_goto_cnum(dbg, dbg->session->maxcnum);
+	return dbg->tid;
+}
+
+/**
+ * \brief Resume the debuggee and run until a user-visible stop event occurs.
+ *
+ * Core execution loop of the debugger. It resumes the target process, handles
+ * internal background events silently (looping back to continue execution),
+ * and only returns control to the caller when a legitimate stop occurs, such
+ * as a user breakpoint or an unexpected crash.
+ *
+ * The function works in three phases:
+ *
+ * 1. Resumption and recoil
+ *    - If a reverse-debugging (time-travel) session is being inspected in the
+ *      past, live execution is skipped and the session is advanced through the
+ *      recorded snapshots instead.
+ *    - If the program counter sits on a breakpoint, the breakpoint is
+ *      temporarily lifted, the target single-steps one instruction, the
+ *      breakpoint is restored, and execution resumes. This prevents the
+ *      debugger from getting stuck on the same instruction.
+ *
+ * 2. Silent event filtering
+ *    After each stop (\ref rz_debug_wait), internal events are handled without
+ *    returning to the caller:
+ *    - Conditional breakpoints: the condition is evaluated and execution
+ *      resumes if it is false.
+ *    - Disabled breakpoints: skipped over.
+ *    - OS events (Linux/Windows): forks, new threads (NEW_TID), thread exits
+ *      and library loads are processed automatically.
+ *    - Tracepoints: the trace data is logged, the tracepoint is stepped over,
+ *      and execution continues.
+ *    - Signals: either passed to the target's own signal handler, or the
+ *      faulting instruction is stepped over to bypass the handler entirely.
+ *
+ * 3. Cleanup and halt
+ *    When a real stop condition is reached, the loop exits and:
+ *    - the debugger's current thread is synchronized to the thread that
+ *      caused the stop,
+ *    - software breakpoints are restored into target memory,
+ *    - if recording is active, a time-travel checkpoint is saved so the user
+ *      can later rewind to this exact stop.
+ *
+ * \param dbg The debugger instance.
+ * \param sig Signal to deliver to the target when resuming (0 for none).
+ *
+ * \return The thread ID (TID) on which the debugger halted, or 0 if the
+ *         process died.
+ */
+RZ_API int rz_debug_continue_kill(RzDebug *dbg, int sig) {
 	if (!dbg) {
 		return 0;
 	}
 
-	// If the debugger is not at the end of the changes
-	// Go to the end or the next breakpoint in the changes
+	// 1. Handle Time-Travel / Replay sessions first
 	if (dbg->session && dbg->session->cnum != dbg->session->maxcnum) {
-		bool has_bp = false;
-		RzRegItem *ripc = rz_reg_get_by_role(dbg->reg, RZ_REG_NAME_PC);
-		if (!ripc) {
+		return session_forward_to_breakpoint(dbg);
+	}
+
+	RzDebugReasonType reason = RZ_DEBUG_REASON_NONE;
+	int ret = 0;
+	RzBreakpointItem *bp = NULL;
+
+	while (true) {
+		if (rz_debug_is_dead(dbg)) {
 			return 0;
 		}
-		RzVector *vreg = ht_up_find(dbg->session->registers, ripc->offset | (ripc->arena << 16), NULL);
-		RzDebugChangeReg *reg;
-		rz_vector_foreach_prev (vreg, reg) {
-			if (reg->cnum <= dbg->session->cnum) {
+
+		if (dbg->session && dbg->trace_continue) {
+			while (!rz_interrupt_is_breaked(dbg->intr)) {
+				if (rz_debug_step(dbg, 1) != 1) {
+					break;
+				}
+				if (dbg->session->reasontype != RZ_DEBUG_REASON_STEP) {
+					break;
+				}
+			}
+			reason = dbg->session->reasontype;
+			bp = dbg->session->bp;
+		} else if (dbg->cur && dbg->cur->cont) {
+			/* handle the stage-2 of breakpoints */
+			if (!rz_debug_recoil(dbg, RZ_DBG_RECOIL_CONTINUE)) {
+				return 0;
+			}
+			/* tell the inferior to go! */
+			ret = dbg->cur->cont(dbg, dbg->pid, dbg->tid, sig);
+			// XXX(jjd): why? //dbg->reason.signum = 0;
+			reason = rz_debug_wait(dbg, &bp);
+		} else {
+			return 0;
+		}
+
+		// Conditional Breakpoints
+		if (dbg->corebind.core) {
+			RzCore *core = (RzCore *)dbg->corebind.core;
+			RzNum *num = core->num;
+			if (reason == RZ_DEBUG_REASON_COND) {
+				if (bp && bp->cond && dbg->corebind.cmd) {
+					dbg->corebind.cmd(dbg->corebind.core, bp->cond);
+				}
+				if (num->value) {
+					continue; // Condition not met, keep running
+				}
+			}
+		}
+		// Disabled Breakpoints
+		if (reason == RZ_DEBUG_REASON_BREAKPOINT &&
+			((bp && !bp->enabled) || (!bp && !rz_interrupt_is_breaked(dbg->intr) && dbg->corebind.core && dbg->corebind.cfggeti(dbg->corebind.core, "dbg.bpsysign")))) {
+			continue;
+		}
+#if __linux__
+		// New Process Forked
+		if (reason == RZ_DEBUG_REASON_NEW_PID && dbg->follow_child) {
+#if DEBUGGER
+			/// if the plugin is not compiled link fails, so better do runtime linking
+			/// until this code gets fixed
+			static bool (*linux_attach_new_process)(RzDebug *dbg, int pid) = NULL;
+			if (!linux_attach_new_process) {
+				linux_attach_new_process = rz_sys_dlsym(NULL, "linux_attach_new_process");
+			}
+			if (linux_attach_new_process) {
+				linux_attach_new_process(dbg, dbg->forked_pid);
+			}
+#endif
+			continue;
+		}
+
+		// New Thread Spawned
+		if (reason == RZ_DEBUG_REASON_NEW_TID) {
+			ret = dbg->tid;
+			if (!dbg->trace_clone) {
 				continue;
 			}
-			has_bp = rz_bp_get_in(dbg->bp, reg->data, RZ_PERM_X) != NULL;
-			if (has_bp) {
-				eprintf("hit breakpoint at: 0x%" PFMT64x " cnum: %d\n", reg->data, reg->cnum);
-				rz_debug_goto_cnum(dbg, reg->cnum);
-				return dbg->tid;
-			}
 		}
 
-		rz_debug_goto_cnum(dbg, dbg->session->maxcnum);
-		return dbg->tid;
-	}
-
-repeat:
-	if (rz_debug_is_dead(dbg)) {
-		return 0;
-	}
-	if (dbg->session && dbg->trace_continue) {
-		while (!rz_cons_is_breaked()) {
-			if (rz_debug_step(dbg, 1) != 1) {
-				break;
-			}
-			if (dbg->session->reasontype != RZ_DEBUG_REASON_STEP) {
-				break;
-			}
+		// Thread Exited
+		if (reason == RZ_DEBUG_REASON_EXIT_TID) {
+			continue;
 		}
-		reason = dbg->session->reasontype;
-		bp = dbg->session->bp;
-	} else if (dbg->cur && dbg->cur->cont) {
-		/* handle the stage-2 of breakpoints */
-		if (!rz_debug_recoil(dbg, RZ_DBG_RECOIL_CONTINUE)) {
+#endif
+
+		if (reason != RZ_DEBUG_REASON_DEAD) {
+			ret = dbg->tid;
+		}
+
+#if __WINDOWS__
+		if (reason == RZ_DEBUG_REASON_NEW_LIB ||
+			reason == RZ_DEBUG_REASON_EXIT_LIB ||
+			reason == RZ_DEBUG_REASON_NEW_TID ||
+			reason == RZ_DEBUG_REASON_NONE ||
+			reason == RZ_DEBUG_REASON_EXIT_TID) {
+			continue;
+		}
+#endif
+
+		if (reason == RZ_DEBUG_REASON_EXIT_PID) {
+#if __WINDOWS__
+			dbg->pid = -1;
+#elif __linux__
+			rz_debug_bp_update(dbg);
+			rz_bp_restore(dbg->bp, false);
+#endif
+		}
+
+		if (reason == RZ_DEBUG_REASON_DEAD || rz_debug_is_dead(dbg)) {
 			return 0;
 		}
-		/* tell the inferior to go! */
-		ret = dbg->cur->cont(dbg, dbg->pid, dbg->tid, sig);
-		// XXX(jjd): why? //dbg->reason.signum = 0;
-		reason = rz_debug_wait(dbg, &bp);
-	} else {
-		return 0;
-	}
 
-	// #if __linux__
-	// 	just_followed_child = followed_child;
-	// 	followed_child = false;
-	// #endif
-
-	if (dbg->corebind.core) {
-		RzCore *core = (RzCore *)dbg->corebind.core;
-		RzNum *num = core->num;
-		if (reason == RZ_DEBUG_REASON_COND) {
-			if (bp && bp->cond && dbg->corebind.cmd) {
-				dbg->corebind.cmd(dbg->corebind.core, bp->cond);
-			}
-			if (num->value) {
-				goto repeat;
-			}
+		// Hit a background Tracepoint
+		if (reason == RZ_DEBUG_REASON_TRACEPOINT) {
+			rz_debug_step(dbg, 1);
+			continue;
 		}
-	}
-	if (reason == RZ_DEBUG_REASON_BREAKPOINT &&
-		((bp && !bp->enabled) || (!bp && !rz_cons_is_breaked() && dbg->corebind.core && dbg->corebind.cfggeti(dbg->corebind.core, "dbg.bpsysign")))) {
-		goto repeat;
-	}
 
-#if __linux__
-	// 	// After following a fork, the child still has the SIGSTOP that the kernel
-	// 	// raised on it at fork time pending. The first continue surfaces that as a
-	// 	// signal-stop at the libc fork() return instead of running on to the user's
-	// 	// breakpoint. Swallow that one SIGSTOP so following a child behaves like
-	// 	// gdb's "set follow-fork-mode child", which lands directly on the breakpoint.
-	// 	if (just_followed_child && reason == RZ_DEBUG_REASON_SIGNAL &&
-	// 		dbg->reason.signum == SIGSTOP) {
-	// 		goto repeat;
-	// 	}
-	// 	if (reason == RZ_DEBUG_REASON_NEW_PID && dbg->follow_child) {
-	// #if DEBUGGER
-	// 		// dbg->pid is still the parent here. linux_attach_new_process() detaches
-	// 		// the parent (without restoring its original code bytes) and switches to
-	// 		// the forked child. The parent shares the inherited software breakpoints
-	// 		// (int3) with the child, so the now-untraced parent would take a fatal
-	// 		// SIGTRAP the moment it executed one of them. Remove the breakpoints from
-	// 		// the parent before it is detached; the child keeps its own int3 bytes
-	// 		// via copy-on-write, so its breakpoints keep working without reinstalling.
-	// 		rz_debug_bp_update(dbg);
-	// 		rz_bp_restore(dbg->bp, false);
-	// 		linux_attach_new_process(dbg, dbg->forked_pid);
-	// 		followed_child = true;
-	// #endif
-	// 		goto repeat;
-	// 	}
-
-	if (reason == RZ_DEBUG_REASON_NEW_PID && dbg->follow_child) {
-		rz_bp_restore(dbg->bp, false);
-		rz_debug_select(dbg, dbg->forked_pid, dbg->forked_pid);
-		goto repeat;
-	}
-
-	if (reason == RZ_DEBUG_REASON_NEW_TID) {
-		ret = dbg->tid;
-		if (!dbg->trace_clone) {
-			goto repeat;
+		// Thread alignment context switch
+		if (ret != dbg->tid) {
+			rz_debug_select(dbg, dbg->pid, ret);
 		}
-	}
+		sig = 0;
 
-	if (reason == RZ_DEBUG_REASON_EXIT_TID) {
-		goto repeat;
-	}
-#endif
-	if (reason != RZ_DEBUG_REASON_DEAD) {
-		ret = dbg->tid;
-	}
-#if __WINDOWS__
-	if (reason == RZ_DEBUG_REASON_NEW_LIB ||
-		reason == RZ_DEBUG_REASON_EXIT_LIB ||
-		reason == RZ_DEBUG_REASON_NEW_TID ||
-		reason == RZ_DEBUG_REASON_NONE ||
-		reason == RZ_DEBUG_REASON_EXIT_TID) {
-		goto repeat;
-	}
-#endif
-	if (reason == RZ_DEBUG_REASON_EXIT_PID) {
-#if __WINDOWS__
-		dbg->pid = -1;
-#elif __linux__
-		rz_debug_bp_update(dbg);
-		rz_bp_restore(dbg->bp, false); // (vdf) there has got to be a better way
-#endif
-	}
+		if (dbg->reason.signum != -1) {
+			int what = rz_debug_signal_what(dbg, dbg->reason.signum);
 
-	/* if continuing killed the inferior, we won't be able to get
-	 * the registers.. */
-	if (reason == RZ_DEBUG_REASON_DEAD || rz_debug_is_dead(dbg)) {
-		return 0;
-	}
-
-	/* if we hit a tracing breakpoint, we need to continue in
-	 * whatever mode the user desired. */
-	if (reason == RZ_DEBUG_REASON_TRACEPOINT) {
-		rz_debug_step(dbg, 1);
-		goto repeat;
-	}
-
-	/* choose the thread that was returned from the continue function */
-	// XXX(jjd): there must be a cleaner way to do this...
-	if (ret != dbg->tid) {
-		rz_debug_select(dbg, dbg->pid, ret);
-	}
-	sig = 0; // clear continuation after signal if needed
-
-	/* handle general signals here based on the return from the wait
-	 * function */
-	if (dbg->reason.signum != -1) {
-		int what = rz_debug_signal_what(dbg, dbg->reason.signum);
-		if (what & RZ_DBG_SIGNAL_CONT) {
-			sig = dbg->reason.signum;
-			eprintf("Continue into the signal %d handler\n", sig);
-			goto repeat;
-		} else if (what & RZ_DBG_SIGNAL_SKIP) {
-			// skip signal. requires skipping one instruction
-			ut8 buf[64];
-			RzAnalysisOp op = { 0 };
-			ut64 pc = rz_debug_reg_get(dbg, "PC");
-			dbg->iob.read_at(dbg->iob.io, pc, buf, sizeof(buf));
-			rz_analysis_op_init(&op);
-			rz_analysis_op(dbg->analysis, &op, pc, buf, sizeof(buf), RZ_ANALYSIS_OP_MASK_BASIC);
-			if (op.size > 0) {
+			if (what & RZ_DBG_SIGNAL_CONT) {
+				sig = dbg->reason.signum;
+				eprintf("Continue into the signal %d handler\n", sig);
+				continue;
+			} else if (what & RZ_DBG_SIGNAL_SKIP) {
 				const char *signame = rz_signal_to_string(dbg->reason.signum);
-				rz_debug_reg_set(dbg, "PC", pc + op.size);
-				eprintf("Skip signal %d handler %s\n",
-					dbg->reason.signum, signame);
-				rz_analysis_op_fini(&op);
-				goto repeat;
-			} else {
+				/*
+				If signal is marked to be skipped but sent via external syscalls, we do not skip the instruction
+				*since it would lead to incorrect execution of further instructions, if sent due to the faulty instruction
+				* we just hit the instruciton so we skip it and move the PC so that we are not stuck hitting the same instruction
+				*/
+				if (dbg->reason.sig_source == RZ_DEBUG_SIGNAL_SOURCE_EXTERNAL) {
+					eprintf("Skipped signal handler for %d (%s)\n", dbg->reason.signum, signame);
+					continue;
+				}
+
+				if (skip_current_instruction(dbg)) {
+					eprintf("Skipped signal handler for %d (%s)\n", dbg->reason.signum, signame);
+					continue;
+				}
+
 				ut64 pc = rz_debug_reg_get(dbg, "PC");
 				eprintf("Stalled with an exception at 0x%08" PFMT64x "\n", pc);
 			}
-			rz_analysis_op_fini(&op);
 		}
+
+		break;
 	}
+
 #if __WINDOWS__
-	rz_cons_break_pop();
+	rz_interrupt_break_pop(dbg->intr);
 #endif
 
-	// Unset breakpoints before leaving
+	// Clean up breakpoints before handing control back to user
 	if (reason != RZ_DEBUG_REASON_BREAKPOINT) {
 		rz_bp_restore(dbg->bp, false);
 	}
 
-	// Add a checkpoint at stops
+	// Add a Time-Travel checkpoint snapshot at this stop
 	if (dbg->session && !dbg->trace_continue) {
 		dbg->session->cnum++;
 		dbg->session->maxcnum++;
@@ -1589,10 +1627,11 @@ RZ_API int rz_debug_continue_syscalls(RzDebug *dbg, int *sc, int n_sc) {
 		eprintf("Cannot find 'sn' register for current arch-os.\n");
 		return -1;
 	}
-	for (;;) {
+
+	while (true) {
 		RzDebugReasonType reason;
 
-		if (rz_cons_singleton()->context->breaked) {
+		if (rz_interrupt_is_breaked(dbg->intr)) {
 			break;
 		}
 #if __linux__
@@ -1809,41 +1848,34 @@ RZ_API void rz_debug_bp_rebase(RzDebug *dbg, ut64 old_base, ut64 new_base) {
 }
 
 /**
- * \brief Switches to the first thread of the current process.
+ * \brief Switches to the first thread in the given debug context.
  * \param debug The debug context.
  */
 RZ_API void rz_debug_switch_to_first_thread(RZ_NONNULL RzDebug *debug) {
 	rz_return_if_fail(debug);
-	if (!debug->cur || !debug->cur->threads) {
-		return;
-	}
-	RzList *threads = debug->cur->threads(debug, debug->pid);
+	RzList *threads = rz_debug_pids(debug, debug->pid);
 	if (rz_list_length(threads) > 0) {
-		RzDebugThread *th = rz_list_first_val(threads);
-		rz_debug_select(debug, debug->pid, th->tid);
+		RzDebugPid *th = rz_list_first_val(threads);
+		rz_debug_select(debug, debug->pid, th->pid);
 	}
 	rz_list_free(threads);
 }
 
-static int thread_find(const int *tid, const RzDebugThread *t, void *user) {
-	return (t && (t->tid == *tid)) ? 0 : 1;
+static int thread_find(int *tid, RzDebugPid *t, void *user) {
+	return (t && (t->pid == *tid)) ? 0 : 1;
 }
 
-/**
- * \brief Finds a thread by its ID in a thread list.
- * \param th_list List of threads to search, may be NULL.
- * \param tid Thread ID.
- * \return The thread, or NULL if it is not in the list.
- */
-RZ_API RZ_BORROW RzDebugThread *rz_debug_get_thread(RZ_NULLABLE RzList /*<RzDebugThread *>*/ *th_list, int tid) {
+RZ_API RzDebugPid *rz_debug_get_thread(RzList /*<RzList *>*/ *th_list, int tid) {
 	if (!th_list) {
 		return NULL;
 	}
-	RzListIter *it = rz_list_find(th_list, &tid, (RzListComparator)thread_find, NULL);
+
+	RzListIter *it = rz_list_find(th_list, (const void *)(size_t)&tid,
+		(RzListComparator)&thread_find, NULL);
 	if (!it) {
 		return NULL;
 	}
-	return (RzDebugThread *)rz_list_val(it);
+	return (RzDebugPid *)rz_list_val(it);
 }
 
 #if !DEBUGGER
