@@ -63,3 +63,43 @@ RZ_IPI RzCmdStatus rz_macros_handler(RzCore *core, const char *name, const char 
 	}
 	return argv ? rz_cmd_macro_call(core->rcmd, name, argv) : RZ_CMD_STATUS_OK;
 }
+
+/*
+ * SDB Format:
+ *
+ *   /macros
+ *     <macro name>={"args":[<str>],"code":<str>,}
+ */
+
+static bool macro_save_cb(RzCmd *cmd, const RzCmdMacro *macro, void *user) {
+	Sdb *db = user;
+	PJ *j = pj_new();
+	if (!j) {
+		return false;
+	}
+	pj_o(j);
+	pj_ka(j, "args");
+	for (size_t i = 0; i < macro->nargs; i++) {
+		pj_s(j, macro->args[i]);
+	}
+	pj_end(j);
+	pj_ks(j, "code", macro->code + 1);
+	pj_end(j);
+	sdb_set(db, macro->name, pj_string(j));
+	pj_free(j);
+	return true;
+}
+
+/**
+ * \brief Save macros to a database.
+ *
+ * Serializes all defined macros from the given \p rcmd into the namespace
+ * "macros" within the database \p db.
+ *
+ * \param db Database to save into.
+ * \param rcmd RzCmd of which macros are to be serialized.
+ */
+RZ_API void rz_serialize_macro_save(RZ_NONNULL Sdb *db, RZ_NONNULL RzCmd *rcmd) {
+	rz_return_if_fail(db && rcmd);
+	rz_cmd_macro_foreach(rcmd, macro_save_cb, db);
+}

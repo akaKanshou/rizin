@@ -628,6 +628,8 @@ RZ_API int rz_cmd_alias_set(RzCmd *cmd, const char *k, const char *v, int remote
 RZ_API char *rz_cmd_alias_get(RzCmd *cmd, const char *k, int remote);
 RZ_API void rz_cmd_alias_free(RzCmd *cmd);
 
+RZ_API void rz_serialize_macro_save(RZ_NONNULL Sdb *db, RZ_NONNULL RzCmd *rcmd);
+
 #ifdef __cplusplus
 }
 #endif

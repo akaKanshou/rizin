@@ -76,6 +76,7 @@ RZ_API void rz_serialize_core_save(RZ_NONNULL Sdb *db, RZ_NONNULL RzCore *core, 
 	rz_serialize_analysis_save(sdb_ns(db, "analysis", true), core->analysis);
 	rz_serialize_debug_save(sdb_ns(db, "debug", true), core->dbg);
 	rz_serialize_core_seek_save(sdb_ns(db, "seek", true), core);
+	rz_serialize_macro_save(sdb_ns(db, "macros", true), core->rcmd); 
 
 	char buf[0x20];
 	if (snprintf(buf, sizeof(buf), "0x%" PFMT64x, core->offset) < 0) {
