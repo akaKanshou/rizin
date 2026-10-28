@@ -105,6 +105,7 @@ RZ_API bool rz_serialize_core_load(RZ_NONNULL Sdb *db, RZ_NONNULL RzCore *core, 
 	SUB("analysis", rz_serialize_analysis_load(subdb, core->analysis, res));
 	SUB("debug", rz_serialize_debug_load(subdb, core->dbg, res));
 	SUB("seek", rz_serialize_core_seek_load(subdb, core, res));
+	SUB("macros", rz_serialize_macro_load(subdb, core->rcmd, res));
 
 	const char *str = sdb_const_get(db, "offset");
 	if (!str || !*str) {

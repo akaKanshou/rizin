@@ -616,6 +616,7 @@ RZ_API void rz_cmd_state_output_print(RZ_NONNULL RzCmdStateOutput *state, RZ_NON
 RZ_API bool rz_cmd_macro_add(RZ_NONNULL RzCmd *cmd, RZ_NONNULL const char *name, const char **args, RZ_NONNULL const char *code);
 RZ_API bool rz_cmd_macro_update(RZ_NONNULL RzCmd *cmd, RZ_NONNULL const char *name, const char **args, RZ_NONNULL const char *code);
 RZ_API bool rz_cmd_macro_rm(RZ_NONNULL RzCmd *cmd, RZ_NONNULL const char *name);
+RZ_API void rz_cmd_macro_rm_all(RZ_NONNULL RzCmd *cmd);
 RZ_API const RzCmdMacro *rz_cmd_macro_get(RZ_NONNULL RzCmd *cmd, RZ_NONNULL const char *name);
 RZ_API RZ_OWN RzList /*<RzCmdMacro *>*/ *rz_cmd_macro_list(RZ_NONNULL RzCmd *cmd);
 RZ_API RzCmdStatus rz_cmd_macro_call(RZ_NONNULL RzCmd *cmd, RZ_NONNULL const char *name, RZ_NONNULL const char **argv);
@@ -629,6 +630,7 @@ RZ_API char *rz_cmd_alias_get(RzCmd *cmd, const char *k, int remote);
 RZ_API void rz_cmd_alias_free(RzCmd *cmd);
 
 RZ_API void rz_serialize_macro_save(RZ_NONNULL Sdb *db, RZ_NONNULL RzCmd *rcmd);
+RZ_API bool rz_serialize_macro_load(RZ_NONNULL Sdb *db, RZ_NONNULL RzCmd *rcmd, RZ_NULLABLE RzSerializeResultInfo *res);
 
 #ifdef __cplusplus
 }

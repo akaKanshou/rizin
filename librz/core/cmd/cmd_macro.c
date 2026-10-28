@@ -103,3 +103,125 @@ RZ_API void rz_serialize_macro_save(RZ_NONNULL Sdb *db, RZ_NONNULL RzCmd *rcmd) 
 	rz_return_if_fail(db && rcmd);
 	rz_cmd_macro_foreach(rcmd, macro_save_cb, db);
 }
+
+typedef enum {
+	BOOKMARK_FIELD_ARGS,
+	BOOKMARK_FIELD_CODE,
+} MacroField;
+
+typedef struct {
+	RzCmd *rcmd;
+	RzKeyParser *parser;
+} MacroLoadCtx;
+
+static bool macros_load_cb(void *user, const SdbKv *kv) {
+	MacroLoadCtx *ctx = user;
+
+	char *json_str = sdbkv_dup_value(kv);
+	if (!json_str) {
+		return true;
+	}
+	RzJson *json = rz_json_parse(json_str);
+	if (!json || json->type != RZ_JSON_OBJECT) {
+		free(json_str);
+		return false;
+	}
+
+	RzCmdMacro proto = { 0 };
+	proto.name = (char *)sdbkv_key(kv);
+	bool res = true;
+
+	RZ_KEY_PARSER_JSON(ctx->parser, json, child, {
+		case BOOKMARK_FIELD_ARGS:
+			if (child->type != RZ_JSON_ARRAY) {
+				res = false;
+				goto beach;
+			}
+			proto.args = calloc(child->children.count, sizeof(char *));
+			proto.nargs = 0;
+			RzJson *baby;
+			for (baby = child->children.first; baby; baby = baby->next) {
+				if (baby->type != RZ_JSON_STRING) {
+					res = false;
+					goto beach;
+				}
+				proto.args[proto.nargs++] = (char *)baby->str_value;
+			}
+			break;
+		case BOOKMARK_FIELD_CODE:
+			if (child->type != RZ_JSON_STRING) {
+				res = false;
+				goto beach;
+			}
+			proto.code = (char *)child->str_value;
+			break;
+		default:
+			break;
+	});
+
+	const RzCmdMacro *macro = rz_cmd_macro_get(ctx->rcmd, proto.name);
+	if (!macro) {
+		if (!rz_cmd_macro_add(ctx->rcmd, proto.name, (const char **)proto.args, proto.code)) {
+			RZ_LOG_ERROR("core: Cannot add macro '%s'\n", proto.name);
+			res = false;
+		}
+	} else {
+		if (!rz_cmd_macro_update(ctx->rcmd, proto.name, (const char **)proto.args, proto.code)) {
+			RZ_LOG_ERROR("core: Cannot update macro '%s'\n", proto.name);
+			res = false;
+		}
+	}
+beach:
+	if (proto.args) {
+		free(proto.args);
+	}
+	rz_json_free(json);
+	free(json_str);
+	return res;
+}
+
+static bool load_macros(RZ_NONNULL Sdb *macros_db, RZ_NONNULL RzCmd *rcmd) {
+	MacroLoadCtx ctx = { rcmd, rz_key_parser_new() };
+	if (!ctx.parser) {
+		return false;
+	}
+	rz_key_parser_add(ctx.parser, "args", BOOKMARK_FIELD_ARGS);
+	rz_key_parser_add(ctx.parser, "code", BOOKMARK_FIELD_CODE);
+	bool r = sdb_foreach(macros_db, macros_load_cb, &ctx);
+	rz_key_parser_free(ctx.parser);
+	return r;
+}
+
+/**
+ * \brief Load macros from a database.
+ *
+ * Clears all existing macros in \p rcmd and loads macros from the namespace
+ * "macros" within the database \p db.
+ *
+ * \param db Database to load from.
+ * \param rcmd RzCmd to populate.
+ * \param res Optional result info structure for reporting errors, may be NULL.
+ * \return True if loading succeeded. False if an error occurred.
+ *
+ * \note If no "macros" namespace exists, this is treated as an empty set
+ *       of macros (not an error).
+ */
+RZ_API bool rz_serialize_macro_load(RZ_NONNULL Sdb *macros_db, RZ_NONNULL RzCmd *rcmd, RZ_NULLABLE RzSerializeResultInfo *res) {
+	rz_return_val_if_fail(macros_db && rcmd, false);
+	rz_cmd_macro_rm_all(rcmd);
+
+	if (!macros_db) {
+		// Old project, no macros saved -> treat as empty, not an error
+		return true;
+	}
+	if (!load_macros(macros_db, rcmd)) {
+		RZ_SERIALIZE_ERR(res, "failed to parse mark json");
+		return false;
+	}
+	return true;
+}
+
+RZ_API void rz_cmd_macro_rm_all(RZ_NONNULL RzCmd *cmd) {
+	rz_return_if_fail(cmd);
+	ht_sp_clear(cmd->macros);
+}
