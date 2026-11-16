@@ -93,6 +93,42 @@ bool test_rz_reg_set_profile_string_fields(void) {
 	mu_end;
 }
 
+static bool test_rz_reg_profile_comments(void) {
+	RzReg *reg = rz_reg_new();
+	mu_assert_notnull(reg, "create register profile");
+	const char *profile =
+		"# profile \"quoted\" C:\\regs\r\n"
+		"=PC pc\n"
+		" \t# indented # comment \t\r\n"
+		"gpr pc .32 0 0 # inline comment\n"
+		"# final comment";
+	const char *comments =
+		"# profile \"quoted\" C:\\regs\n"
+		"# indented # comment\n"
+		"# final comment\n";
+	mu_assert_true(rz_reg_set_profile_string(reg, profile), "parse commented profile");
+	mu_assert_streq(reg->reg_profile_cmt, comments, "retain full-line comments");
+	RzRegItem *pc = rz_reg_get(reg, "pc", RZ_REG_TYPE_GPR);
+	mu_assert_notnull(pc, "parse register after comments");
+	mu_assert_streq(pc->comment, "inline comment", "retain per-register comment separately");
+	mu_assert_true(rz_reg_set_profile_string(reg, profile), "reuse cached profile");
+	mu_assert_streq(reg->reg_profile_cmt, comments, "do not duplicate cached comments");
+	mu_assert_true(rz_reg_set_profile_string(reg, "gpr r0 .32 0 0\n"), "replace profile");
+	mu_assert_null(reg->reg_profile_cmt, "clear comments on profile replacement");
+	mu_assert_true(rz_reg_set_profile_string(reg, "# only a comment"), "comment-only profile");
+	mu_assert_streq(reg->reg_profile_cmt, "# only a comment\n", "unterminated comment");
+	mu_assert_true(rz_reg_set_profile_string(reg, ""), "empty profile");
+	mu_assert_null(reg->reg_profile_cmt, "clear comments on empty profile");
+	mu_assert_false(rz_reg_set_profile_string(reg, "# discarded\ninvalid pc .32 0 0\n"),
+		"reject invalid register type");
+	mu_assert_null(reg->reg_profile_cmt, "discard comments from a failed parse");
+	mu_assert_null(reg->reg_profile_str, "do not cache a failed profile");
+	mu_assert_true(rz_reg_set_profile_string(reg, profile), "load profile after parse failure");
+	mu_assert_streq(reg->reg_profile_cmt, comments, "retain comments after recovery");
+	rz_reg_free(reg);
+	mu_end;
+}
+
 bool test_rz_reg_get_value_gpr(void) {
 	RzReg *reg;
 	ut64 value;
@@ -514,9 +550,41 @@ bool test_rz_reg_profile_to_cc(void) {
 	mu_end;
 }
 
+static bool test_rz_reg_profile_cleanup(void) {
+	rz_reg_free(NULL);
+	RzReg *reg = rz_reg_new();
+	mu_assert_notnull(reg, "create register state");
+	mu_assert_true(rz_reg_set_profile_string(reg, ""), "load an empty profile");
+	for (size_t i = 0; i < RZ_REG_TYPE_LAST; i++) {
+		mu_assert_null(reg->regset[i].regs, "empty profiles need no register lists");
+		mu_assert_notnull(reg->regset[i].pool, "profile replacement preserves arena pools");
+	}
+	mu_assert_true(rz_reg_set_profile_string(reg, "gpr pc .32 0 0\n"), "load register definitions");
+	mu_assert_true(rz_reg_setv(reg, "pc", 42), "write a register after an empty profile");
+	mu_assert_eq(rz_reg_getv(reg, "pc"), 42, "read a register after an empty profile");
+	mu_assert_false(rz_reg_set_profile_string(reg, "invalid pc .32 0 0\n"),
+		"reject invalid register type");
+	mu_assert_true(rz_reg_set_profile_string(reg, "gpr pc .32 0 0 # inline comment\n"),
+		"load register definitions after parse failure");
+	mu_assert_notnull(rz_reg_get(reg, "pc", RZ_REG_TYPE_GPR), "register definition exists");
+	mu_assert_true(rz_reg_set_profile_string(reg, "gpr sp .32 0 0\n"), "replace register definitions");
+	const RzList *items = rz_reg_get_list(reg, RZ_REG_TYPE_GPR);
+	mu_assert_eq(rz_list_length(items), 1, "replacement removes the old register item");
+	RzRegItem *item = rz_list_first_val(items);
+	mu_assert_notnull(item, "replacement register exists");
+	mu_assert_streq(item->name, "sp", "only the replacement register remains");
+	mu_assert_false(rz_reg_set_profile_string(reg, "invalid pc .32 0 0\n"),
+		"reject another invalid profile");
+	mu_assert_null(reg->regset[RZ_REG_TYPE_GPR].regs, "final cleanup releases the register list");
+	mu_assert_null(reg->allregs, "cleanup drops the register index");
+	rz_reg_free(reg);
+	mu_end;
+}
+
 int all_tests() {
 	mu_run_test(test_rz_reg_set_profile_string);
 	mu_run_test(test_rz_reg_set_profile_string_fields);
+	mu_run_test(test_rz_reg_profile_comments);
 	mu_run_test(test_rz_reg_get_value_gpr);
 	mu_run_test(test_rz_reg_get_value_flag);
 	mu_run_test(test_rz_reg_get);
@@ -525,6 +593,7 @@ int all_tests() {
 	mu_run_test(test_rz_reg_get_bv);
 	mu_run_test(test_rz_reg_set_bv);
 	mu_run_test(test_rz_reg_profile_to_cc);
+	mu_run_test(test_rz_reg_profile_cleanup);
 	return tests_passed != tests_run;
 }
 

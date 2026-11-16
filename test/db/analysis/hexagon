@@ -464,8 +464,7 @@ pd 1
 EOF
 EXPECT=<<EOF
             ; CALL XREF from sym.__libc_start_main @ 0x5e98
-/ int main(int argc, char **argv, char **envp);
-|           ; arg int argc @ R0
+/ int main(int argc @ R0, char **argv, char **envp);
 |           0x00005110      [   allocframe(SP,#0x8):raw
 EOF
 RUN
@@ -478,21 +477,20 @@ s main
 agf
 EOF
 EXPECT=<<EOF
-          .---------------------------------------------------.
-          |  0x5110                                           |
-          |   ; CALL XREF from sym.__libc_start_main @ 0x5e98 |
-          | int main(int argc, char **argv, char **envp);     |
-          | ; arg int argc @ R0                               |
-          | [   allocframe(SP,#0x8):raw                       |
-          | [   R2 = add(FP,##-0x4)                           |
-          | [   memw(R2+#0x0) = ##0x0                         |
-          | [   R2 = add(FP,##-0x8)                           |
-          | [   memw(R2+#0x0) = ##0x0                         |
-          | [   jump 0x5128                                   |
-          `---------------------------------------------------'
-              v
-              |
-              '------.
+         .----------------------------------------------------.
+         |  0x5110                                            |
+         |   ; CALL XREF from sym.__libc_start_main @ 0x5e98  |
+         | int main(int argc @ R0, char **argv, char **envp); |
+         | [   allocframe(SP,#0x8):raw                        |
+         | [   R2 = add(FP,##-0x4)                            |
+         | [   memw(R2+#0x0) = ##0x0                          |
+         | [   R2 = add(FP,##-0x8)                            |
+         | [   memw(R2+#0x0) = ##0x0                          |
+         | [   jump 0x5128                                    |
+         `----------------------------------------------------'
+             v
+             |
+             '-------.
 .----------------------.
 |                    | |
 |              .-----------------------------------------.
@@ -1511,6 +1509,22 @@ EXPECT=<<EOF
 |           0x00008f30      [   R17:16 = memd(R29+#0x8) ; R19:18 = memd(R29+#0x0)
 |           0x00008f34      /       jump sym._Mbtowcx
 \           0x00008f38      \       LR:FP = deallocframe(FP):raw
+EOF
+RUN
+
+# The packet at 0x8f30 is first decoded without its predecessor (0x8f20-0x8f2c, 4 words) in the buffer,
+# so it is marked invalid. Decoding the predecessor afterwards must mark the following packet valid.
+NAME=hexagon packet after multi-word packet becomes valid
+FILE=bins/elf/analysis/hexagon-hello-loop
+CMDS=<<EOF
+pi 1 @ 0x00008f34
+pi 1 @ 0x00008f20
+pi 1 @ 0x00008f30
+EOF
+EXPECT=<<EOF
+/   jump sym._Mbtowcx
+/   R1:0 = combine(R18,R19)
+[   R17:16 = memd(R29+#0x8) ; R19:18 = memd(R29+#0x0)
 EOF
 RUN
 

@@ -244,9 +244,9 @@ RZ_API RZ_OWN RzGraph /*<RzGraphNodeInfo *, None *>*/ *rz_core_graph_callgraph(R
 typedef char *(*GraphBodyFn)(RzCore *core, ut64 addr, RzAnalysisBlock *bb);
 
 static inline char *block_disasm(RzCore *core, ut64 addr, RzAnalysisBlock *bb) {
-	RzAnalysisBlock *b = rz_analysis_find_most_relevant_block_in(core->analysis, addr);
+	RzAnalysisBlock *b = bb ? bb : rz_analysis_find_most_relevant_block_in(core->analysis, addr);
 	if (!b) {
-		RZ_LOG_ERROR("Cannot find function at 0x%08" PFMT64x "\n", addr);
+		// Unanalyzed branch targets are still useful as nodes without a body.
 		return NULL;
 	}
 	ut8 *block = malloc(b->size + 1);
@@ -322,14 +322,13 @@ static void core_graph_fn_bbs(RzCore *core, RzAnalysisFunction *fcn, RzGraph /*<
 		RzAnalysisCaseOp *case_op;
 		RzListIter *iter_case;
 		rz_list_foreach (bbi->switch_op->cases, iter_case, case_op) {
-			RzGraphNode *case_node = graph_add_cached(core, cache, NULL, case_op->addr, graph, body_fn);
+			if (case_op->jump == UT64_MAX) {
+				continue;
+			}
+			/* Case metadata does not represent an intermediate control-flow node. */
+			RzGraphNode *case_node = graph_add_cached(core, cache, NULL, case_op->jump, graph, body_fn);
 			if (case_node) {
 				rz_graph_add_edge(graph, bb_node, case_node, NULL);
-			}
-
-			RzGraphNode *case_jump_node = graph_add_cached(core, cache, NULL, case_op->jump, graph, body_fn);
-			if (case_jump_node) {
-				rz_graph_add_edge(graph, case_node, case_jump_node, NULL);
 			}
 		}
 	}
@@ -432,7 +431,13 @@ static char *block_line(RzCore *core, ut64 addr, RzAnalysisBlock *bb) {
 			file_str = rz_file_slurp_line(file, line, 0);
 			if (file_str) {
 				ut32 len = strlen(file_str);
-				cmd_str = realloc(cmd_str, idx + len + 8);
+				char *tmp = realloc(cmd_str, idx + len + 8);
+				if (!tmp) {
+					free(file_str);
+					free(cmd_str);
+					return NULL;
+				}
+				cmd_str = tmp;
 				memcpy(cmd_str + idx, file_str, len);
 				idx += len;
 				if (is_html) {
